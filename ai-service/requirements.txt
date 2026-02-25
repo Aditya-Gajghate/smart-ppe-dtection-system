@@ -1,0 +1,14 @@
+fastapi
+uvicorn
+python-multipart
+Pillow
+numpy
+opencv-python
+ultralytics
+pydantic
+aiofiles
+motor
+pymongo
+requests
+python-dotenv
+face_recognition
