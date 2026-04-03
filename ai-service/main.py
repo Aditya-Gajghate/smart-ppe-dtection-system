@@ -29,9 +29,9 @@ except ImportError:
 MONGODB_URI = os.getenv("MONGODB_URI")
 PPE_MODEL_PATH = os.getenv("PPE_MODEL", "models/ppe_best.pt")
 CACHE_TTL = 5  # Seconds to cache recognized identity
-PPE_CONF_THRESHOLD = float(os.getenv("PPE_CONF_THRESHOLD", 0.5))
+PPE_CONF_THRESHOLD = float(os.getenv("PPE_CONF_THRESHOLD", 0.20))
 HISTORY_SIZE = 5
-CONSISTENCY_THRESHOLD = 3
+CONSISTENCY_THRESHOLD = 1
 
 class SystemState:
     IDLE = "IDLE"
@@ -76,11 +76,12 @@ def enhance_image(frame):
     """Normalize brightness using CLAHE and optional scale adjustment"""
     try:
         # User tip: Improve low-light detection
-        frame = cv2.convertScaleAbs(frame, alpha=1.2, beta=20)
+        # Subtle enhancement (v2): Lower alpha and clipLimit for less burnout
+        frame = cv2.convertScaleAbs(frame, alpha=1.1, beta=10)
         
         lab = cv2.cvtColor(frame, cv2.COLOR_BGR2LAB)
         l, a, b = cv2.split(lab)
-        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        clahe = cv2.createCLAHE(clipLimit=1.5, tileGridSize=(8, 8))
         cl = clahe.apply(l)
         limg = cv2.merge((cl, a, b))
         return cv2.cvtColor(limg, cv2.COLOR_LAB2BGR)
@@ -95,11 +96,12 @@ def get_face_crop(frame, loc, padding=0.7):
     fh = bottom - top
     fw = right - left
     
-    # Industrial-grade padding: expand bottom more for mask/chin
-    ntop = max(0, int(top - fh * padding * 0.4))
+    # Construction-grade padding: expand top significantly for helmets
+    # Using 1.4 * face height to ensure full yellow hardhats are included
+    ntop = max(0, int(top - fh * padding * 2.0))
     nbottom = min(h, int(bottom + fh * padding * 1.8)) 
-    nleft = max(0, int(left - fw * padding * 0.9))
-    nright = min(w, int(right + fw * padding * 0.9))
+    nleft = max(0, int(left - fw * padding * 1.0))
+    nright = min(w, int(right + fw * padding * 1.0))
     
     return frame[ntop:nbottom, nleft:nright]
 
@@ -198,6 +200,8 @@ async def lifespan(app: FastAPI):
         print(f"Model Classes Available: {classes}") 
         if "mask" not in [c.lower() for c in classes]:
              print("WARNING: 'mask' class not found in current model. Mask detection WILL fail.")
+        if not any(x in [c.lower() for c in classes] for x in ["helmet", "hardhat"]):
+             print("WARNING: 'helmet' class not found in current model. Helmet detection WILL fail.")
     except Exception as e:
         print(f"Error loading YOLO model: {e}")
 
@@ -295,14 +299,22 @@ async def recognize(file: UploadFile = File(...)):
         }
 
     # --- 2. State Actions ---
-    rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    # USE ORIGINAL FRAME for face detection (enhancement can mess with landmarks)
+    rgb_frame = cv2.cvtColor(original_frame, cv2.COLOR_BGR2RGB)
     face_locations = []
     
     if FACE_REC_AVAILABLE:
-        face_locations = face_recognition.face_locations(rgb_frame)
+        face_locations = face_recognition.face_locations(rgb_frame, number_of_times_to_upsample=2)
         if face_locations:
             system_state["last_face_seen"] = now
             system_state["last_face_location"] = face_locations[0]
+            print(f"[FACE DEBUG] Found {len(face_locations)} face(s) at {face_locations[0]}")
+        else:
+             if system_state["current_state"] == SystemState.IDLE:
+                  # Silent in idle or maybe a small hint
+                  pass
+             else:
+                  print("[FACE DEBUG] Face lost in current frame while in active session.")
 
     detected_name = "Unknown"
     is_recognized = False
@@ -343,19 +355,21 @@ async def recognize(file: UploadFile = File(...)):
              loc = face_locations[0]
              face_location = {"top": loc[0], "right": loc[1], "bottom": loc[2], "left": loc[3]}
         else:
-             # Fallback: Can we find a person to infer head location?
-             # We'll run a quick YOLO pass on full frame if needed
+             # Fallback: Discovery Mode - If no face found in IDLE, we still want to see if we can find a helmet
              face_location = None
-             if system_state["last_face_location"]:
-                 loc = system_state["last_face_location"]
-                 face_location = {"top": loc[0], "right": loc[1], "bottom": loc[2], "left": loc[3]}
+             if system_state["current_state"] == SystemState.IDLE:
+                  # Log that we are entering IDLE discovery scan
+                  pass
+             elif system_state["last_face_location"]:
+                  loc = system_state["last_face_location"]
+                  face_location = {"top": loc[0], "right": loc[1], "bottom": loc[2], "left": loc[3]}
 
-    # C. PPE Detection Logic
-    if system_state["current_state"] in [SystemState.FACE_RECOGNIZED, SystemState.WAITING_FOR_PPE]:
+    # C. PPE Detection Logic (Active Session OR Discovery Mode)
+    if system_state["current_state"] in [SystemState.FACE_RECOGNIZED, SystemState.WAITING_FOR_PPE] or system_state["current_state"] == SystemState.IDLE:
         system_state["frame_count"] += 1
         
-        # Adaptive Timeout: If any mask seen in recent frames, extend session by 2s (up to max cap)
-        if any(system_state["ppe_history"]["mask"]):
+        # Adaptive Timeout: If any mask or helmet seen in recent frames, extend session by 0.5s (up to max cap)
+        if any(system_state["ppe_history"]["mask"]) or any(system_state["ppe_history"]["helmet"]):
             system_state["lock_start_time"] = min(now, system_state["lock_start_time"] + 0.5)
 
         # Performance: Optimization Every 2nd frame
@@ -363,12 +377,22 @@ async def recognize(file: UploadFile = File(...)):
             if ppe_model:
                 frame_ppe = { "helmet": False, "mask": False, "vest": False }
                 max_conf = { "helmet": 0.0, "mask": 0.0, "vest": 0.0 }
-                passes = [frame]
+                # Check both enhanced and original frames if needed
+                passes = [frame, original_frame]
                 
                 if face_location:
                     loc_tuple = (face_location["top"], face_location["right"], face_location["bottom"], face_location["left"])
-                    crop = get_face_crop(frame, loc_tuple)
+                    # Increased crop significantly again (3.0x now) to be absolutely sure the whole helmet is caught
+                    crop = get_face_crop(frame, loc_tuple, padding=1.2)
                     passes.insert(0, crop)
+                    original_crop = get_face_crop(original_frame, loc_tuple, padding=1.2)
+                    passes.insert(1, original_crop)
+                else:
+                    # Discovery Mode: No face found, let's scan the full frame to see if a helmet is there
+                    if system_state["current_state"] == SystemState.IDLE and system_state["frame_count"] % 10 == 0:
+                         print("[PPE DISCOVERY] No face found. Scanning full frame for PPE presence...")
+                    # We just use the full frame (which is already in 'passes' as [frame, original_frame])
+                    pass
 
                 for i, detection_frame in enumerate(passes):
                     results = ppe_model(detection_frame, verbose=False)
@@ -380,26 +404,47 @@ async def recognize(file: UploadFile = File(...)):
                         conf, cls_id = box[4], int(box[5])
                         label = names[cls_id].lower()
                         
+                        label = names[cls_id].lower()
+                        # RAW LOGGING for all objects seen by YOLO
+                        source = f"{'enhanced' if i%2==0 else 'original'} {'crop' if i<2 else 'frame'}"
+                        print(f"[PPE DEBUG] SAW: {label} | CONF: {conf:.2f} | FROM: {source}")
+                        
                         if conf < PPE_CONF_THRESHOLD: continue
                         
-                        is_helmet = any(x in label for x in ["helmet", "hardhat"])
+                        is_helmet = any(x in label for x in ["helmet", "hardhat", "hard_hat", "hard hat", "hat", "cap", "head"]) and "no" not in label
                         is_mask = "mask" in label and "no" not in label
-                        is_vest = any(x in label for x in ["vest", "safety_vest"])
+                        is_vest = any(x in label for x in ["vest", "safety_vest"]) and "no" not in label
 
                         if is_helmet: 
                             frame_ppe["helmet"] = True
                             max_conf["helmet"] = max(max_conf["helmet"], conf)
+                            print(f"[PPE DEBUG] --- HELMET MATCHED ({conf:.2f}) ---")
+
                         if is_mask: 
                             frame_ppe["mask"] = True
                             max_conf["mask"] = max(max_conf["mask"], conf)
+                            print(f"[PPE DEBUG] --- MASK MATCHED ({conf:.2f}) ---")
+
                         if is_vest: 
                             frame_ppe["vest"] = True
                             max_conf["vest"] = max(max_conf["vest"], conf)
+                            print(f"[PPE DEBUG] --- VEST MATCHED ({conf:.2f}) ---")
                         
                         if is_helmet or is_mask or is_vest: pass_detected_anything = True
 
-                    if i == 0 and pass_detected_anything and face_location:
-                        break
+                    # Only break if we've found all REQUIRED items in this pass (crop)
+                    if i < 2 and pass_detected_anything and face_location:
+                        # Check if all required items were found in crop
+                        requirements = system_state["required_ppe"]
+                        found_all_in_crop = True
+                        for item, req in requirements.items():
+                            if req and not frame_ppe.get(item, False):
+                                # If item is missing from crop but required, don't break yet, check full frame
+                                found_all_in_crop = False
+                                break
+                        
+                        if found_all_in_crop:
+                            break
 
                 # --- Multi-Frame History Update ---
                 for ppe_type in ["mask", "helmet", "vest"]:
@@ -408,10 +453,9 @@ async def recognize(file: UploadFile = File(...)):
                         system_state["ppe_history"][ppe_type].append(True if frame_ppe[ppe_type] else False)
                         history_list = list(system_state["ppe_history"][ppe_type])
                         
-                        # Debug Log
-                        if ppe_type == "mask" and frame_ppe["mask"]:
-                            print(f"Mask detected: True | Confidence: {max_conf['mask']:.2f}")
-                            print(f"Mask history: {[1 if x else 0 for x in history_list]}")
+                        # Debug log for all types
+                        if frame_ppe[ppe_type]:
+                             print(f"{ppe_type.capitalize()} history link added. Current state: {[1 if x else 0 for x in history_list]}")
 
                         if history_list.count(True) >= CONSISTENCY_THRESHOLD:
                             system_state["ppe_locked"][ppe_type] = True
@@ -422,6 +466,11 @@ async def recognize(file: UploadFile = File(...)):
                 # Check Compliance
                 compliance = get_compliance_status(system_state["ppe_status"], system_state["required_ppe"])
                 
+                # DIAGNOSTIC: Why is it still waiting?
+                if not compliance["compliant"]:
+                     missing = [item for item, req in system_state["required_ppe"].items() if req and not system_state["ppe_status"].get(item)]
+                     print(f"[PPE DEBUG] Still missing required items: {missing}")
+
                 # STICKY COMPLIANCE: If already compliant, stay compliant until reset/completed
                 if system_state["current_state"] == SystemState.PPE_COMPLIANT:
                     pass 
