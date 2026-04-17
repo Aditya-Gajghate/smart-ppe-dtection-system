@@ -17,10 +17,10 @@
 
 ## Phase 4: Frontend Development
 - [ ] Dashboard Layout (Sidebar, Navbar)
-- [ ] Employee Management Page (Add/List employees)
-- [ ] Camera Component (WebRTC capture)
-- [ ] Real-time Attendance Page (Canvas overlay for bounding boxes)
-- [ ] Attendance Reports & Analytics
+- [x] Employee Management Page (Update: Added Edit/Update functionality)
+- [x] Camera Component (WebRTC capture)
+- [x] Real-time Attendance Page (Canvas overlay for bounding boxes)
+- [x] Attendance Reports & Analytics (Update: Added Employee Name field)
 
 ## Phase 5: Integration & Logic
 - [ ] Connect Frontend Camera to Python Microservice

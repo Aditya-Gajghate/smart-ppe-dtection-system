@@ -1,6 +1,6 @@
-
 import dbConnect from "@/lib/dbConnect";
 import Attendance from "@/models/Attendance";
+import Employee from "@/models/Employee";
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
 import { CheckCircle, XCircle } from "lucide-react";
@@ -10,7 +10,16 @@ export const dynamic = 'force-dynamic';
 async function getAttendance() {
     await dbConnect();
     const records = await Attendance.find({}).sort({ timestamp: -1 }).limit(50).lean();
-    return records;
+    
+    // Map employee names
+    const employeeIds = [...new Set(records.map((r: any) => r.employeeId as string))];
+    const employees = await Employee.find({ employeeId: { $in: employeeIds } }).lean();
+    const employeeMap = Object.fromEntries(employees.map((e: any) => [e.employeeId, e.name]));
+
+    return records.map((r: any) => ({
+        ...r,
+        employeeName: employeeMap[r.employeeId] || "Unknown"
+    }));
 }
 
 export default async function ReportsPage() {
@@ -27,6 +36,7 @@ export default async function ReportsPage() {
                     <TableHeader className="bg-slate-50">
                         <TableRow>
                             <TableHead>Timestamp</TableHead>
+                            <TableHead>Employee Name</TableHead>
                             <TableHead>Employee ID</TableHead>
                             <TableHead>Status</TableHead>
                             <TableHead>Details</TableHead>
@@ -40,7 +50,8 @@ export default async function ReportsPage() {
                                     <TableCell className="font-mono text-xs">
                                         {new Date(record.timestamp).toLocaleString()}
                                     </TableCell>
-                                    <TableCell className="font-medium">{record.employeeId}</TableCell>
+                                    <TableCell className="font-semibold">{record.employeeName}</TableCell>
+                                    <TableCell className="font-medium text-slate-500">{record.employeeId}</TableCell>
                                     <TableCell>
                                         <Badge variant={record.status === 'PRESENT' ? 'default' : 'destructive'}
                                             className={record.status === 'PRESENT' ? 'bg-emerald-500 hover:bg-emerald-600' : ''}>
@@ -71,7 +82,7 @@ export default async function ReportsPage() {
                             ))
                         ) : (
                             <TableRow>
-                                <TableCell colSpan={5} className="text-center py-10 text-muted-foreground">
+                                <TableCell colSpan={6} className="text-center py-10 text-muted-foreground">
                                     No attendance records found.
                                 </TableCell>
                             </TableRow>

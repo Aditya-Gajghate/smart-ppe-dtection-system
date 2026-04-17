@@ -15,12 +15,13 @@ import {
 } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
 import AddEmployeeDialog from "@/components/AddEmployeeDialog";
+import EditEmployeeDialog from "@/components/EditEmployeeDialog";
 
 async function getEmployees() {
     await dbConnect();
     // Lean query for performance
     const employees = await Employee.find({}).lean();
-    return employees as unknown as IEmployee[];
+    return JSON.parse(JSON.stringify(employees));
 }
 
 export default async function EmployeesPage() {
@@ -45,7 +46,7 @@ export default async function EmployeesPage() {
                         </TableRow>
                     </TableHeader>
                     <TableBody>
-                        {employees.map((employee) => (
+                        {employees.map((employee: any) => (
                             <TableRow key={String(employee._id)}>
                                 <TableCell className="font-medium">{employee.employeeId}</TableCell>
                                 <TableCell>{employee.name}</TableCell>
@@ -58,8 +59,8 @@ export default async function EmployeesPage() {
                                         {employee.ppeRequirements.vest && <Badge variant="outline">Vest</Badge>}
                                     </div>
                                 </TableCell>
-                                <TableCell className="text-right">
-                                    <Button variant="ghost" size="sm">Edit</Button>
+                                <TableCell className="text-right px-4">
+                                    <EditEmployeeDialog employee={employee} />
                                 </TableCell>
                             </TableRow>
                         ))}
