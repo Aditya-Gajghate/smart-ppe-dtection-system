@@ -12,3 +12,4 @@ pymongo
 requests
 python-dotenv
 face_recognition
+pyserial

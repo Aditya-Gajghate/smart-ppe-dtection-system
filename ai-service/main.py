@@ -13,6 +13,7 @@ import uvicorn
 from ultralytics import YOLO
 from pathlib import Path
 from collections import deque
+import serial
 
 # Load environment variables
 load_dotenv()
@@ -33,6 +34,10 @@ PPE_CONF_THRESHOLD = float(os.getenv("PPE_CONF_THRESHOLD", 0.20))
 HISTORY_SIZE = 5
 CONSISTENCY_THRESHOLD = 1
 
+# Arduino Configuration
+ARDUINO_PORT = os.getenv("ARDUINO_PORT", "COM8")
+ARDUINO_BAUD = int(os.getenv("ARDUINO_BAUD", 9600))
+
 class SystemState:
     IDLE = "IDLE"
     FACE_RECOGNIZED = "FACE_RECOGNIZED"
@@ -50,6 +55,10 @@ known_face_encodings = []
 known_face_names = []
 # Cache: { "name": last_seen_timestamp }
 identity_cache = {}
+
+# Arduino Serial Connection
+arduino_serial = None
+last_arduino_signal = None
 
 # System State Management
 system_state = {
@@ -71,6 +80,36 @@ PPE_WINDOW = 20     # Time allowed to wear PPE
 FACE_LOST_TIMEOUT = 10 # More lenient face lost timeout
 
 # --- Helper Functions ---
+
+def send_arduino_signal(signal):
+    """Sends a signal ('1' or '0') to the Arduino via Serial"""
+    global arduino_serial, last_arduino_signal
+    if arduino_serial and arduino_serial.is_open:
+        if signal != last_arduino_signal:
+            try:
+                arduino_serial.write(signal.encode())
+                last_arduino_signal = signal
+                print(f"[ARDUINO] Sent signal: {signal}")
+            except Exception as e:
+                print(f"[ARDUINO] Error sending signal: {e}")
+    else:
+        # Try to reconnect if it was supposed to be open
+        print("[ARDUINO] Not connected")
+
+def update_arduino_by_state():
+    """Centralized state-to-signal mapping for Arduino"""
+    global last_arduino_signal
+    state = system_state["current_state"]
+
+    if state in [SystemState.PPE_COMPLIANT, SystemState.COMPLETED]:
+        if last_arduino_signal != '1':
+            send_arduino_signal('1')
+    elif state in [SystemState.WAITING_FOR_PPE, SystemState.FACE_RECOGNIZED, SystemState.TIMEOUT, SystemState.REJECTED]:
+        if last_arduino_signal != '2':
+            send_arduino_signal('2')
+    elif state == SystemState.IDLE:
+        if last_arduino_signal != '0':
+            send_arduino_signal('0')
 
 def enhance_image(frame):
     """Normalize brightness using CLAHE and optional scale adjustment"""
@@ -148,7 +187,7 @@ def get_compliance_status(detected_ppe, required_ppe):
     }
 
 def reset_system():
-    global system_state
+    global system_state, last_arduino_signal
     print("Resetting state to IDLE")
     system_state = {
         "current_state": SystemState.IDLE,
@@ -165,6 +204,8 @@ def reset_system():
         "frame_count": 0,
         "success_time": 0
     }
+    # State-based update handles the signal
+    update_arduino_by_state()
 
 # --- Lifespan ---
 
@@ -204,6 +245,17 @@ async def lifespan(app: FastAPI):
              print("WARNING: 'helmet' class not found in current model. Helmet detection WILL fail.")
     except Exception as e:
         print(f"Error loading YOLO model: {e}")
+
+    # 4. Initialize Arduino Serial
+    try:
+        global arduino_serial
+        print(f"Initializing Arduino on {ARDUINO_PORT}...")
+        arduino_serial = serial.Serial(ARDUINO_PORT, ARDUINO_BAUD, timeout=1)
+        time.sleep(2) # Wait for Arduino reset
+        print("Arduino initialized.")
+        send_arduino_signal('0') # Start with locked state
+    except Exception as e:
+        print(f"Arduino Connection Error: {e}")
 
     yield
     
@@ -291,6 +343,7 @@ async def recognize(file: UploadFile = File(...)):
             print(f"Session successfully ended for {system_state['user_name']}. Returning to IDLE.")
             reset_system()
         
+        update_arduino_by_state()
         return {
             "state": SystemState.COMPLETED,
             "name": system_state["user_name"],
@@ -474,25 +527,28 @@ async def recognize(file: UploadFile = File(...)):
                 # STICKY COMPLIANCE: If already compliant, stay compliant until reset/completed
                 if system_state["current_state"] == SystemState.PPE_COMPLIANT:
                     pass 
-                elif compliance["compliant"]:
-                    print("PPE COMPLIANT")
+                elif compliance["compliant"] and system_state["current_state"] != SystemState.IDLE and system_state["required_ppe"]:
+                    print(f"PPE COMPLIANT for {system_state['user_name']}")
                     system_state["current_state"] = SystemState.PPE_COMPLIANT
                     system_state["ppe_start_time"] = now # Reset timer for stuck check
                     if not system_state["attendance_marked"]:
                         print(f"PPE Verified for {system_state['user_name']}. Waiting for marking signal...")
-                elif now - system_state["ppe_start_time"] > 2:
-                    # Only revert if we haven't reached full compliance yet
-                    if system_state["current_state"] != SystemState.PPE_COMPLIANT:
-                        print(f"WAITING FOR PPE: {system_state['ppe_status']}")
-                        system_state["current_state"] = SystemState.WAITING_FOR_PPE
+                else:
+                    # Logic handled by centralized update_arduino_by_state()
+                    if now - system_state["ppe_start_time"] > 2:
+                        # Only revert if we haven't reached full compliance yet
+                        if system_state["current_state"] != SystemState.PPE_COMPLIANT:
+                            print(f"WAITING FOR PPE: {system_state['ppe_status']}")
+                            system_state["current_state"] = SystemState.WAITING_FOR_PPE
 
+    # --- 3. Construct Response ---
+    update_arduino_by_state()
     # Safety: Auto-reset if stuck in PPE_COMPLIANT for > 20 seconds without signal
     if system_state["current_state"] == SystemState.PPE_COMPLIANT:
         if now - system_state["ppe_start_time"] > 20:
              print(f"Stuck in compliance for {system_state['user_name']}. Auto-resetting.")
              reset_system()
 
-    # --- 3. Construct Response ---
     # Calculate time left for compliance ONLY (Pause if compliant/completed)
     time_left = 0
     if system_state["current_state"] in [SystemState.FACE_RECOGNIZED, SystemState.WAITING_FOR_PPE]:
